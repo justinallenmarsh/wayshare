@@ -133,10 +133,6 @@ impl Sender {
 
     fn send_frame(&mut self, out: crate::encode::EncodedFrame) {
         let t0 = Instant::now();
-        if out.frame_size != self.pk.config().frame_size {
-            info!(from = ?self.pk.config().frame_size, to = ?out.frame_size, "HP stream resized");
-            self.pk.set_frame_size(out.frame_size);
-        }
         let mut tiles: Vec<Option<&[u8]>> = vec![None; self.tiles];
         for t in &out.tiles {
             if let Some(slot) = tiles.get_mut(t.index as usize) {
@@ -180,7 +176,20 @@ impl Sender {
     }
 }
 
-pub(super) fn run_media(p: MediaParams, stop: &AtomicBool) -> Result<()> {
+/// Why the media thread ended without an error.
+#[derive(Debug, PartialEq)]
+pub(super) enum MediaEnd {
+    Stopped,
+    /// The output no longer matches the size this stream was negotiated at. Nothing at the
+    /// new size was sent: the session tells the viewer the new geometry and offers a new
+    /// stream.
+    OutputResized {
+        width: u32,
+        height: u32,
+    },
+}
+
+pub(super) fn run_media(p: MediaParams, stop: &AtomicBool) -> Result<MediaEnd> {
     let sock = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), p.port))
         .with_context(|| format!("binding UDP {}", p.port))?;
     sock.connect(SocketAddr::new(p.peer, p.port))?;
@@ -199,7 +208,7 @@ pub(super) fn run_media(p: MediaParams, stop: &AtomicBool) -> Result<()> {
     let mut backend = EncoderBackend::auto(std::path::Path::new(RENDER_NODE), &p.encoder);
     let mut cap = open_capturer(p.output.as_deref(), backend)?;
     let Some(mut first) = first_frame(&mut cap, stop)? else {
-        return Ok(());
+        return Ok(MediaEnd::Stopped);
     };
     // The capture node is final after the first frame and may be a different GPU.
     let usable = backend.check(cap.render_node()).is_ok();
@@ -216,17 +225,19 @@ pub(super) fn run_media(p: MediaParams, stop: &AtomicBool) -> Result<()> {
             cap = open_capturer(p.output.as_deref(), picked)?;
             first = match first_frame(&mut cap, stop)? {
                 Some(f) => f,
-                None => return Ok(()),
+                None => return Ok(MediaEnd::Stopped),
             };
         }
         backend = picked;
     }
     let (w, h) = (first.buffer.width, first.buffer.height);
-    ensure!(
-        (w, h) == p.stream_size,
-        "captured {w}x{h} but the answer advertised {:?}",
-        p.stream_size
-    );
+    if (w, h) != p.stream_size {
+        // The output changed while this stream was being negotiated.
+        return Ok(MediaEnd::OutputResized {
+            width: w,
+            height: h,
+        });
+    }
     let mut enc: Encoder = backend.open(cap.render_node(), w, h, &p.encoder)?;
     info!(
         ?backend,
@@ -278,18 +289,11 @@ pub(super) fn run_media(p: MediaParams, stop: &AtomicBool) -> Result<()> {
         .name("hp-send".into())
         .spawn(move || sender.run(frame_rx))?;
 
-    let render_node = cap.render_node().clone();
-    let mut reopen = |w: u32, h: u32| -> Result<Encoder> {
-        let mut e = backend.open(&render_node, w, h, &p.encoder)?;
-        e.set_output(frame_tx.clone());
-        Ok(e)
-    };
     let r = media_loop(
         stop,
         &sock,
         &mut cap,
         &mut enc,
-        &mut reopen,
         &mut rc,
         &mut rx,
         first,
@@ -337,13 +341,12 @@ fn media_loop(
     sock: &UdpSocket,
     cap: &mut Capturer,
     enc: &mut Encoder,
-    reopen: &mut dyn FnMut(u32, u32) -> Result<Encoder>,
     rc: &mut RateController,
     rx: &mut SrtpContext,
     first: crate::capture::Frame,
     start: Instant,
     send_stats: &Mutex<SendStats>,
-) -> Result<()> {
+) -> Result<MediaEnd> {
     let mut stats = Stats::default();
     let mut last_log = Instant::now();
     let mut last_forced_idr: Option<Instant> = None;
@@ -365,11 +368,13 @@ fn media_loop(
             let l = enc.layout();
             let size = (frame.buffer.width, frame.buffer.height);
             if size != (l.width, l.height) {
-                // The viewer accepts new dimensions in-band from a refresh (a new encoder starts
-                // with one); the sender switches the packetizer when it sees the new size.
-                info!(from = ?(l.width, l.height), to = ?size, "HP encoder resizing");
-                *enc = reopen(size.0, size.1)?;
-                enc.set_bitrate(rc.target_bps() as u64);
+                // The viewer decodes a new size in-band but keeps its old window, so it would
+                // stretch the picture. End here and let the session renegotiate at the new size.
+                info!(from = ?(l.width, l.height), to = ?size, "shared output changed size");
+                return Ok(MediaEnd::OutputResized {
+                    width: size.0,
+                    height: size.1,
+                });
             }
             if last_rtcp.is_none()
                 && last_forced_idr.is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
@@ -448,7 +453,7 @@ fn media_loop(
         }
     }
     info!(frames = stats.frames, "HP media stopping");
-    Ok(())
+    Ok(MediaEnd::Stopped)
 }
 
 fn repeat_frame(f: &crate::capture::Frame) -> crate::capture::Frame {
