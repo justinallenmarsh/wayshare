@@ -69,7 +69,6 @@ pub fn capture_factory(output: Option<String>) -> FrameSourceFactory {
     })
 }
 
-/// The output's scale as Hyprland reports it, or `None` if it can't be read.
 fn output_scale(output: Option<&str>) -> Option<f64> {
     use crate::display::DisplayManager;
     let outs = crate::display::hyprland::Hyprland::from_env()
@@ -173,7 +172,6 @@ struct Media {
     peer: IpAddr,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
-    /// Set when the media thread ended because the output changed size.
     resized_to: Arc<Mutex<Option<OutputResize>>>,
 }
 
@@ -225,12 +223,10 @@ impl LinuxHp {
         use crate::display::DisplayManager;
         let mut hypr = crate::display::hyprland::Hyprland::from_env()?;
         let name = self.output.as_deref().unwrap_or_default();
-        let out = hypr
-            .outputs()?
+        hypr.outputs()?
             .into_iter()
             .find(|o| self.output.is_none() || o.name == name)
-            .with_context(|| format!("output {name:?} not found"))?;
-        Ok(out)
+            .with_context(|| format!("output {name:?} not found"))
     }
 }
 
@@ -399,7 +395,8 @@ impl HpBackend for LinuxHp {
         };
         let stop = Arc::new(AtomicBool::new(false));
         let resized_to = Arc::new(Mutex::new(None));
-        let (thread_stop, thread_resized_to) = (stop.clone(), resized_to.clone());
+        let thread_stop = stop.clone();
+        let thread_resized_to = resized_to.clone();
         let thread = std::thread::Builder::new()
             .name("hp-media".into())
             .spawn(move || match media::run_media(params, &thread_stop) {
@@ -407,12 +404,12 @@ impl HpBackend for LinuxHp {
                 Ok(media::MediaEnd::OutputResized {
                     width,
                     height,
-                    before_first_frame,
+                    first_frame_mismatch,
                 }) => {
                     let px = |v: u32| v.min(u16::MAX as u32) as u16;
                     *thread_resized_to.lock().unwrap() = Some(OutputResize {
                         pixels: (px(width), px(height)),
-                        before_first_frame,
+                        first_frame_mismatch,
                     });
                 }
                 Err(e) => warn!("HP media stopped: {e:#}"),

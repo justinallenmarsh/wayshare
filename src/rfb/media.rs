@@ -52,11 +52,10 @@ pub struct MediaAnswer {
     pub video2: Vec<u8>,
 }
 
-/// The shared output's size after it changed under a running HP stream.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OutputResize {
     pub pixels: (u16, u16),
-    pub before_first_frame: bool,
+    pub first_frame_mismatch: bool,
 }
 
 /// Implemented by the High Performance media module.
@@ -80,8 +79,7 @@ pub trait HpBackend: Send + Sync {
     fn active(&self, _session: super::SessionId) -> bool {
         true
     }
-    /// Returned once if `session`'s media stopped because the output changed size. The
-    /// session then renegotiates instead of falling back to Standard.
+    /// Returns a stopped stream's resize once.
     fn take_output_resize(&self, _session: super::SessionId) -> Option<OutputResize> {
         None
     }

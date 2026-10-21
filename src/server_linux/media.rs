@@ -176,17 +176,14 @@ impl Sender {
     }
 }
 
-/// Why the media thread ended without an error.
 #[derive(Debug, PartialEq)]
 pub(super) enum MediaEnd {
     Stopped,
-    /// The output no longer matches the size this stream was negotiated at. Nothing at the
-    /// new size was sent: the session tells the viewer the new geometry and offers a new
-    /// stream.
+    /// No frame at the new size has been sent to the viewer.
     OutputResized {
         width: u32,
         height: u32,
-        before_first_frame: bool,
+        first_frame_mismatch: bool,
     },
 }
 
@@ -233,11 +230,10 @@ pub(super) fn run_media(p: MediaParams, stop: &AtomicBool) -> Result<MediaEnd> {
     }
     let (w, h) = (first.buffer.width, first.buffer.height);
     if (w, h) != p.stream_size {
-        // The output changed while this stream was being negotiated.
         return Ok(MediaEnd::OutputResized {
             width: w,
             height: h,
-            before_first_frame: true,
+            first_frame_mismatch: true,
         });
     }
     let mut enc: Encoder = backend.open(cap.render_node(), w, h, &p.encoder)?;
@@ -376,7 +372,7 @@ fn media_loop(
                 return Ok(MediaEnd::OutputResized {
                     width: size.0,
                     height: size.1,
-                    before_first_frame: false,
+                    first_frame_mismatch: false,
                 });
             }
             if last_rtcp.is_none()

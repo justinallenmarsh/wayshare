@@ -108,7 +108,7 @@ pub async fn run(mut stream: TcpStream, cfg: Arc<Config>, id: SessionId) -> Resu
         device_info_sent: false,
         hp_offered: false,
         hp_restarting: false,
-        hp_first_mismatch: None,
+        last_first_frame_mismatch: None,
         unsupported_size: None,
         clip: ClipboardSync::default(),
     };
@@ -204,6 +204,12 @@ struct InputStats {
     since: Option<std::time::Instant>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CaptureSizeMismatch {
+    negotiated: (u16, u16),
+    captured: (u16, u16),
+}
+
 struct Session {
     input_stats: InputStats,
     id: SessionId,
@@ -243,7 +249,7 @@ struct Session {
     hp_offered: bool,
     /// HP media was stopped on purpose for a display change; a new msg 28 is expected.
     hp_restarting: bool,
-    hp_first_mismatch: Option<((u16, u16), (u16, u16))>,
+    last_first_frame_mismatch: Option<CaptureSizeMismatch>,
     unsupported_size: Option<(u16, u16)>,
     clip: ClipboardSync,
 }
@@ -397,7 +403,7 @@ impl Session {
                         self.dynamic_resolution =
                             req.displays.first().is_some_and(|d| d.dynamic_resolution());
                         // Like Apple's host: stop HP media, resize, then offer a new stream.
-                        self.hp_first_mismatch = None;
+                        self.last_first_frame_mismatch = None;
                         self.stop_hp_for_display_change();
                         if let Some(display) = self.cfg.display.clone() {
                             match blocking(|| display.configure(self.id, &req)) {
@@ -534,18 +540,18 @@ impl Session {
         Ok(())
     }
 
-    /// Stops HP media before a display change. `media_active` stays true: the viewer is still
-    /// in HP and answers the new offer with another msg 28.
+    /// Keep media_active set until the viewer answers the replacement offer.
     fn stop_hp_for_display_change(&mut self) {
-        if let Some(hp) = self.media_active.then(|| self.cfg.hp.clone()).flatten() {
+        if self.media_active
+            && let Some(hp) = &self.cfg.hp
+        {
             blocking(|| hp.stop(self.id));
             self.hp_restarting = true;
             info!("HP media stopped for display change");
         }
     }
 
-    /// Sends the new size and offers a new stream. The viewer only ends its resize
-    /// transition on a new stream's first frame.
+    /// The viewer ends its resize transition on the new stream's first frame.
     async fn reoffer_hp(&mut self) -> Result<()> {
         if self.media_active {
             self.sync_size().await?;
@@ -555,9 +561,6 @@ impl Session {
         Ok(())
     }
 
-    /// The HP media stopped because the shared output changed size (a monitor rule,
-    /// `hyprctl reload`). Tell the viewer the new geometry and offer a stream at that size,
-    /// the same way a msg 29 resize does.
     async fn renegotiate_for_output(&mut self, resize: media::OutputResize) -> Result<()> {
         let pixels = resize.pixels;
         info!(from = ?self.fb_size, to = ?pixels, "renegotiating HP for the new output size");
@@ -586,11 +589,10 @@ impl Session {
         };
         if size == self.fb_size {
             self.unsupported_size = None;
-            if self
-                .display_applied
-                .is_some_and(|applied| applied.pixels == size)
+            if let Some(applied) = self.display_applied
+                && applied.pixels == size
             {
-                let applied = self.display_applied.take().unwrap();
+                self.display_applied = None;
                 self.send_display_info(applied).await?;
             }
             return Ok(());
@@ -964,9 +966,13 @@ impl Session {
         if let Some(resize) = hp.take_output_resize(self.id)
             && self.supports(ENC_DESKTOP_SIZE)
         {
-            let mismatch = (self.fb_size, resize.pixels);
-            let repeated = resize.before_first_frame && self.hp_first_mismatch == Some(mismatch);
-            self.hp_first_mismatch = resize.before_first_frame.then_some(mismatch);
+            let mismatch = CaptureSizeMismatch {
+                negotiated: self.fb_size,
+                captured: resize.pixels,
+            };
+            let repeated =
+                resize.first_frame_mismatch && self.last_first_frame_mismatch == Some(mismatch);
+            self.last_first_frame_mismatch = resize.first_frame_mismatch.then_some(mismatch);
             if !repeated {
                 return self.renegotiate_for_output(resize).await;
             }
@@ -1699,12 +1705,13 @@ mod tests {
         let _ = server.await.unwrap();
     }
 
-    /// The first stream's media ends right away because the output became 80x48,
-    /// as after a monitor rule or `hyprctl reload`.
-    struct ResizedHp(Arc<Log>, std::sync::atomic::AtomicBool);
+    struct ResizedHp {
+        log: Arc<Log>,
+        resize_reported: std::sync::atomic::AtomicBool,
+    }
     impl media::HpBackend for ResizedHp {
         fn ports(&self) -> MediaPorts {
-            self.0.push("ports".into());
+            self.log.push("ports".into());
             MediaPorts::default()
         }
         fn configure(
@@ -1719,24 +1726,28 @@ mod tests {
             false
         }
         fn take_output_resize(&self, _: SessionId) -> Option<media::OutputResize> {
-            let first = !self.1.swap(true, std::sync::atomic::Ordering::Relaxed);
+            let first = !self
+                .resize_reported
+                .swap(true, std::sync::atomic::Ordering::Relaxed);
             first.then_some(media::OutputResize {
                 pixels: (80, 48),
-                before_first_frame: false,
+                first_frame_mismatch: false,
             })
         }
         fn stop(&self, _: SessionId) {
-            self.0.push("hp stop".into());
+            self.log.push("hp stop".into());
         }
     }
 
-    /// Starts HP with a viewer that advertises `encodings`; the media ends for a resize.
     async fn resized_session(
         encodings: &[i32],
     ) -> (Arc<Log>, TcpStream, tokio::task::JoinHandle<Result<()>>) {
         let log = Arc::new(Log::default());
         let mut cfg = test_config();
-        cfg.hp = Some(Arc::new(ResizedHp(log.clone(), Default::default())));
+        cfg.hp = Some(Arc::new(ResizedHp {
+            log: log.clone(),
+            resize_reported: Default::default(),
+        }));
         let (mut client, server) = start(cfg).await.unwrap();
         let mut msgs = vec![2, 0, 0, encodings.len() as u8];
         for e in encodings {
@@ -1747,8 +1758,6 @@ mod tests {
         (log, client, server)
     }
 
-    /// The viewer only learns the size from DesktopSize and display info, so a stream that
-    /// ended for an output resize must renegotiate, not fall back to Standard mode.
     #[tokio::test(flavor = "multi_thread")]
     async fn output_resize_renegotiates_hp() {
         let (log, mut client, server) =
@@ -1765,7 +1774,6 @@ mod tests {
         let _ = server.await.unwrap();
     }
 
-    /// A viewer without DesktopSize can't follow the resize: fall back once, never loop.
     #[tokio::test(flavor = "multi_thread")]
     async fn output_resize_without_desktop_size_falls_back_once() {
         let (log, mut client, server) = resized_session(&[ENC_MEDIA_STREAM]).await;
@@ -1824,7 +1832,7 @@ mod tests {
         fn take_output_resize(&self, _: SessionId) -> Option<media::OutputResize> {
             Some(media::OutputResize {
                 pixels: (80, 48),
-                before_first_frame: self.persistent_mismatch,
+                first_frame_mismatch: self.persistent_mismatch,
             })
         }
     }
@@ -1896,7 +1904,6 @@ mod tests {
         assert!(pos(&info) < pos(&answer));
         assert_eq!(*extent.lock().unwrap(), (96, 64));
 
-        // An unchanged configuration must not send a duplicate display transition.
         client.write_all(&media_config().encode()).await.unwrap();
         let got = read_until(&mut client, "unchanged answer", |got| has_seq(got, &answer)).await;
         assert!(!has_seq(&got, &size));
