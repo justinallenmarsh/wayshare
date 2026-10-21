@@ -221,7 +221,7 @@ impl LinuxHp {
 }
 
 impl LinuxHp {
-    fn output_size(&self) -> Result<(u32, u32)> {
+    fn output_info(&self) -> Result<crate::display::OutputInfo> {
         use crate::display::DisplayManager;
         let mut hypr = crate::display::hyprland::Hyprland::from_env()?;
         let name = self.output.as_deref().unwrap_or_default();
@@ -230,7 +230,7 @@ impl LinuxHp {
             .into_iter()
             .find(|o| self.output.is_none() || o.name == name)
             .with_context(|| format!("output {name:?} not found"))?;
-        Ok((out.width, out.height))
+        Ok(out)
     }
 }
 
@@ -294,7 +294,10 @@ impl HpBackend for LinuxHp {
         peer: SocketAddr,
         config: MediaStreamConfig,
     ) -> Result<Option<MediaAnswer>> {
-        let stream_size = self.output_size()?;
+        let output = self.output_info()?;
+        let stream_size = (output.width, output.height);
+        let px = |v: u32| v.min(u16::MAX as u32) as u16;
+        let pixels = (px(output.width), px(output.height));
         let video = Offer::parse(&config.video1.offer).context("parsing video offer")?;
         let audio = Offer::parse(&config.audio.offer).context("parsing audio offer")?;
         let v = negotiation::answer(
@@ -397,18 +400,19 @@ impl HpBackend for LinuxHp {
         let stop = Arc::new(AtomicBool::new(false));
         let resized_to = Arc::new(Mutex::new(None));
         let (thread_stop, thread_resized_to) = (stop.clone(), resized_to.clone());
-        let output = self.output.clone();
         let thread = std::thread::Builder::new()
             .name("hp-media".into())
             .spawn(move || match media::run_media(params, &thread_stop) {
                 Ok(media::MediaEnd::Stopped) => {}
-                Ok(media::MediaEnd::OutputResized { width, height }) => {
+                Ok(media::MediaEnd::OutputResized {
+                    width,
+                    height,
+                    before_first_frame,
+                }) => {
                     let px = |v: u32| v.min(u16::MAX as u32) as u16;
-                    // Asked here, off the session loop: the session needs the scale for the
-                    // viewer's point size.
                     *thread_resized_to.lock().unwrap() = Some(OutputResize {
                         pixels: (px(width), px(height)),
-                        scale: output_scale(output.as_deref()),
+                        before_first_frame,
                     });
                 }
                 Err(e) => warn!("HP media stopped: {e:#}"),
@@ -423,6 +427,14 @@ impl HpBackend for LinuxHp {
         });
 
         Ok(Some(MediaAnswer {
+            display: Some(crate::rfb::AppliedDisplay {
+                pixels,
+                points: (
+                    (pixels.0 as f64 / output.scale).round() as u16,
+                    (pixels.1 as f64 / output.scale).round() as u16,
+                ),
+                scale: output.scale,
+            }),
             flags: 1,
             audio: a.bytes,
             video1: v.bytes,

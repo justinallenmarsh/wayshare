@@ -186,6 +186,7 @@ pub(super) enum MediaEnd {
     OutputResized {
         width: u32,
         height: u32,
+        before_first_frame: bool,
     },
 }
 
@@ -236,6 +237,7 @@ pub(super) fn run_media(p: MediaParams, stop: &AtomicBool) -> Result<MediaEnd> {
         return Ok(MediaEnd::OutputResized {
             width: w,
             height: h,
+            before_first_frame: true,
         });
     }
     let mut enc: Encoder = backend.open(cap.render_node(), w, h, &p.encoder)?;
@@ -374,6 +376,7 @@ fn media_loop(
                 return Ok(MediaEnd::OutputResized {
                     width: size.0,
                     height: size.1,
+                    before_first_frame: false,
                 });
             }
             if last_rtcp.is_none()

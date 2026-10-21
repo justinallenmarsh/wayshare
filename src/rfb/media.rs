@@ -42,8 +42,10 @@ pub struct MediaStreamConfig {
     pub video2: Option<StreamOffer>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct MediaAnswer {
+    /// Geometry used to build this answer; not part of the media wire payload.
+    pub display: Option<super::AppliedDisplay>,
     pub flags: u32,
     pub audio: Vec<u8>,
     pub video1: Vec<u8>,
@@ -54,8 +56,7 @@ pub struct MediaAnswer {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OutputResize {
     pub pixels: (u16, u16),
-    /// `None` if the compositor couldn't be asked.
-    pub scale: Option<f64>,
+    pub before_first_frame: bool,
 }
 
 /// Implemented by the High Performance media module.
@@ -368,6 +369,7 @@ mod tests {
     #[test]
     fn answer_layout_matches_screensharingd() {
         let msg = answer_update(&MediaAnswer {
+            display: None,
             flags: 1,
             audio: vec![0xa; 3],
             video1: vec![0xb; 5],
